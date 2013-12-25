@@ -83,43 +83,54 @@ public class ArrayBlockingQueue<E> extends AbstractQueue<E>
      */
     private static final long serialVersionUID = -817911632652898426L;
 
-    /** The queued items */
-    final Object[] items;
-
-    /** items index for next take, poll, peek or remove */
-    int takeIndex;
-
-    /** items index for next put, offer, or add */
-    int putIndex;
-
-    /** Number of elements in the queue */
-    int count;
-
-    /*
-     * Concurrency control uses the classic two-condition algorithm
-     * found in any textbook.
-     */
-
-    /** Main lock guarding all access */
-    final ReentrantLock lock;
-    /** Condition for waiting takes */
-    private final Condition notEmpty;
-    /** Condition for waiting puts */
-    private final Condition notFull;
+	/** The queued items */
+	// 队列存放元素的容器
+	final Object[] items;
+	
+	/** items index for next take, poll, peek or remove */
+	// 下一次读取或移除的位置
+	int takeIndex;
+	
+	/** items index for next put, offer, or add */
+	// 存放下一个放入元素的位置
+	int putIndex;
+	
+	/** Number of elements in the queue */
+	// 队列里有效元素的数量
+	int count;
+	
+	/*
+	 * Concurrency control uses the classic two-condition algorithm
+	 * found in any textbook.
+	 */
+	
+	/** Main lock guarding all access */
+	// 所有访问的保护锁
+	final ReentrantLock lock;
+	
+	/** Condition for waiting takes */
+	// 等待获取的条件
+	private final Condition notEmpty;
+	
+	/** Condition for waiting puts */
+	// 等待放入的条件
+	private final Condition notFull;
 
     // Internal helper methods
 
     /**
      * Circularly increment i.
      */
-    final int inc(int i) {
+    // 指针前移
+	final int inc(int i) {
         return (++i == items.length) ? 0 : i;
     }
 
     /**
      * Circularly decrement i.
      */
-    final int dec(int i) {
+	// 指针后移
+	final int dec(int i) {
         return ((i == 0) ? items.length : i) - 1;
     }
 
@@ -149,24 +160,26 @@ public class ArrayBlockingQueue<E> extends AbstractQueue<E>
      * Inserts element at current put position, advances, and signals.
      * Call only when holding lock.
      */
+    // 在持有锁的前提下调用
     private void insert(E x) {
         items[putIndex] = x;
-        putIndex = inc(putIndex);
-        ++count;
-        notEmpty.signal();
+        putIndex = inc(putIndex); // 指针前移 1
+        ++count; // 有效元素数量加 1
+        notEmpty.signal(); // 通知在非空条件上等待的读线程
     }
 
     /**
      * Extracts element at current take position, advances, and signals.
      * Call only when holding lock.
      */
+    // 在持有锁的前提下调用
     private E extract() {
         final Object[] items = this.items;
         E x = this.<E>cast(items[takeIndex]);
-        items[takeIndex] = null;
-        takeIndex = inc(takeIndex);
-        --count;
-        notFull.signal();
+        items[takeIndex] = null; // for GC，避免内存泄露；也用于判断元素是否被移除
+        takeIndex = inc(takeIndex); // 指针前移 1
+        --count; // 有效元素数量减 1
+        notFull.signal(); // 通知在非满条件上等待的写线程
         return x;
     }
 
@@ -175,28 +188,33 @@ public class ArrayBlockingQueue<E> extends AbstractQueue<E>
      * Utility for remove and iterator.remove.
      * Call only when holding lock.
      */
+    // 在持有锁的前提下调用
     void removeAt(int i) {
         final Object[] items = this.items;
         // if removing front item, just advance
+        // 如果要移除是元素就是下一个可读数据，直接移除、修改读指针即可。
+        // 这是一种优化，避免数据拷贝。
         if (i == takeIndex) {
             items[takeIndex] = null;
             takeIndex = inc(takeIndex);
         } else {
             // slide over all others up through putIndex.
+        	// 如果要移除元素是在有效数据的中间，那么要把它之后添加的元素后移
+        	// 注意：这里不能用读写指针的大小关系作为终结条件，也是因为环绕。
             for (;;) {
                 int nexti = inc(i);
                 if (nexti != putIndex) {
                     items[i] = items[nexti];
                     i = nexti;
                 } else {
-                    items[i] = null;
-                    putIndex = i;
+                    items[i] = null; // for GC
+                    putIndex = i; // putIndex 不是直接减 1 还是因为环绕。
                     break;
                 }
             }
         }
         --count;
-        notFull.signal();
+        notFull.signal(); // 
     }
 
     /**
@@ -292,6 +310,7 @@ public class ArrayBlockingQueue<E> extends AbstractQueue<E>
      *
      * @throws NullPointerException if the specified element is null
      */
+    // 
     public boolean offer(E e) {
         checkNotNull(e);
         final ReentrantLock lock = this.lock;
@@ -316,15 +335,25 @@ public class ArrayBlockingQueue<E> extends AbstractQueue<E>
      * @throws NullPointerException {@inheritDoc}
      */
     public void put(E e) throws InterruptedException {
-        checkNotNull(e);
+        checkNotNull(e); // 不允许存空值，JUC下线程安全的容器都不允许存空值。
+        
+        // 在JUC的很多类里，都会看到这种写法：把类的属性赋值给方法内的一个变量。
+        // 这是因为类的属性是存放在堆里的，方法内的变量是存放在方法栈上的，访问方法栈比访问堆要快。
+        // 在这里，this.lock属性要访问两次，通过赋值给方法的局部变量，就节省了一次堆的访问。
+        // 其他的类属性只访问一次就不需要这样处理了。优化无处不在！！
         final ReentrantLock lock = this.lock;
-        lock.lockInterruptibly();
+        
+        lock.lockInterruptibly(); // 加锁
         try {
+        	// 放在循环里是避免虚假唤醒
+        	// 容器满的时候持续等待
             while (count == items.length)
+            	// await 方法会导致当前线程释放锁，等待其他线程唤醒，唤醒后重新获取锁
                 notFull.await();
+            
             insert(e);
         } finally {
-            lock.unlock();
+            lock.unlock();  // 释放锁
         }
     }
 
@@ -368,13 +397,13 @@ public class ArrayBlockingQueue<E> extends AbstractQueue<E>
 
     public E take() throws InterruptedException {
         final ReentrantLock lock = this.lock;
-        lock.lockInterruptibly();
+        lock.lockInterruptibly();   // 加锁
         try {
             while (count == 0)
                 notEmpty.await();
             return extract();
         } finally {
-            lock.unlock();
+            lock.unlock();  // 释放锁
         }
     }
 
@@ -734,17 +763,18 @@ public class ArrayBlockingQueue<E> extends AbstractQueue<E>
      * have moved between calls to next.
      */
     private class Itr implements Iterator<E> {
-        private int remaining; // Number of elements yet to be returned
-        private int nextIndex; // Index of element to be returned by next
-        private E nextItem;    // Element to be returned by next call to next
-        private E lastItem;    // Element returned by last call to next
-        private int lastRet;   // Index of last element returned, or -1 if none
+        private int remaining; // Number of elements yet to be returned  // 剩余可返回元素数量
+        private int nextIndex; // Index of element to be returned by next // 下一个可返回元素的位置
+        private E nextItem;    // Element to be returned by next call to next // 下一个可返回的元素
+        private E lastItem;    // Element returned by last call to next // 上一次返回的元素
+        private int lastRet;   // Index of last element returned, or -1 if none // 上次返回的元素的位置，-1 表示没有。
 
         Itr() {
             final ReentrantLock lock = ArrayBlockingQueue.this.lock;
             lock.lock();
             try {
                 lastRet = -1;
+                // 初始化的时候记录容器的当前存在元素（通过记录数  count 和读指针 takeIndex）。
                 if ((remaining = count) > 0)
                     nextItem = itemAt(nextIndex = takeIndex);
             } finally {
@@ -762,17 +792,22 @@ public class ArrayBlockingQueue<E> extends AbstractQueue<E>
             try {
                 if (remaining <= 0)
                     throw new NoSuchElementException();
+                
                 lastRet = nextIndex;
-                E x = itemAt(nextIndex);  // check for fresher value
-                if (x == null) {
-                    x = nextItem;         // we are forced to report old value
-                    lastItem = null;      // but ensure remove fails
-                }
-                else
+                
+                E x = itemAt(nextIndex);  // check for fresher value  // 检查元素是否被更新
+                if (x == null) { // 该位置元素被移除了
+                    x = nextItem;         // we are forced to report old value // 只能被迫返回旧值
+                    lastItem = null;      // but ensure remove fails // 用于使移除操作失败
+                } else {
                     lastItem = x;
+                }
+                
+                // 跳过空元素（也就是迭代器创建之后被移除的元素）
                 while (--remaining > 0 && // skip over nulls
-                       (nextItem = itemAt(nextIndex = inc(nextIndex))) == null)
+                       (nextItem = itemAt(nextIndex = inc(nextIndex))) == null) // 设置下一次要返回的元素
                     ;
+                
                 return x;
             } finally {
                 lock.unlock();
@@ -791,6 +826,8 @@ public class ArrayBlockingQueue<E> extends AbstractQueue<E>
                 lastItem = null;
                 // only remove if item still at index
                 if (x != null && x == items[i]) {
+                	// 只有在上次调用 next() 方法时候当前遍历位置的元素仍然在那里时才移除
+                	
                     boolean removingHead = (i == takeIndex);
                     removeAt(i);
                     if (!removingHead)
