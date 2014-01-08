@@ -175,15 +175,18 @@ public class ConcurrentLinkedQueue<E> extends AbstractQueue<E>
      * optimization.
      */
 
+    // 作为无锁算法，只能通过 volatile 和 sun.misc.Unsafe UNSAFE 提供的  CAS 操作来保证内存可见性和原子性。
     private static class Node<E> {
-        volatile E item;
-        volatile Node<E> next;
+        volatile E item; // 结点存储的实际元素
+        volatile Node<E> next; // 指向后继的指针
 
         /**
          * Constructs a new node.  Uses relaxed write because item can
          * only be seen after publication via casNext.
          */
         Node(E item) {
+        	// 使用宽松的写是因为item只能在通过casNext发布之后才能看到。
+        	// （这里也就是说 UNSAFE.putObject 的内存语义比 volatile 写要宽松些，也就高效点）
             UNSAFE.putObject(this, itemOffset, item);
         }
 
@@ -230,6 +233,16 @@ public class ConcurrentLinkedQueue<E> extends AbstractQueue<E>
      * - head.item may or may not be null.
      * - it is permitted for tail to lag behind head, that is, for tail
      *   to not be reachable from head!
+     *   
+     * 通过这个结点能够在 O(1) 时间到达第一个存活（非已删除）结点，如果有的话。
+     * 不变式：
+     * - 所有存活结点可以 从 head 开始通过 succ() 访问。
+     * - head != null 
+     * - (tmp = head).next != tmp || tmp != head，这个不变式是说 head 
+     * 
+     * 可变式：
+     * - head.item 可能是、也可能不是空的。
+     * - 允许 tail 落后于 head，那是因为 tail 不能从 head 到达。
      */
     private transient volatile Node<E> head;
 
@@ -244,6 +257,18 @@ public class ConcurrentLinkedQueue<E> extends AbstractQueue<E>
      * - it is permitted for tail to lag behind head, that is, for tail
      *   to not be reachable from head!
      * - tail.next may or may not be self-pointing to tail.
+     * 
+     * 从它可以在 O(1) 时间访问到队列的最后一个结点（唯一的满足 node.next == null 的结点）。
+     * 这个也就是说 tail 指向的并不总是最后一个存活结点。
+     * 
+     * 不变式：
+     * - 最后的结点总是可以从 tail 开始通过 succ() 访问。
+     * - tail != null 
+     * 
+     * 可变式：
+     * - tail.item 可能是、也可能不是空。
+     * - 允许 tail 落后于 head，那是因为 tail 不能从 head 到达。
+     * - tail.next 可能是、也可能不是 自指向到 tail。
      */
     private transient volatile Node<E> tail;
 
@@ -310,6 +335,9 @@ public class ConcurrentLinkedQueue<E> extends AbstractQueue<E>
      * linked to self, which will only be true if traversing with a
      * stale pointer that is now off the list.
      */
+    /*
+     * 返回 p 的后继，如果 p 已被移除，则返回 head。
+     */
     final Node<E> succ(Node<E> p) {
         Node<E> next = p.next;
         return (p == next) ? head : next;
@@ -330,17 +358,31 @@ public class ConcurrentLinkedQueue<E> extends AbstractQueue<E>
             Node<E> q = p.next;
             if (q == null) {
                 // p is last node
+            	// p 是队列的最后一个结点。（后继为空的就是最后一个存活结点。这很重要！）
                 if (p.casNext(null, newNode)) {
+                	// CAS 成功使 e 成为队列的元素，新节点变为 "存活"。
                     // Successful CAS is the linearization point
                     // for e to become an element of this queue,
                     // and for newNode to become "live".
+                	
+                	// 每次跳过两个结点，也就是不是每次添加一个结点都修改tail属性的。
+                	// 这是因为在下面的casTail成功之前，其他线程可能又添加了新的结点，
+                	// 所以在并发大的情况下，这个casTail几乎总是失败的，没必要每次都调用。
+                	// （这里也就是说 tail 是批量更新的）
                     if (p != t) // hop two nodes at a time
-                        casTail(t, newNode);  // Failure is OK.
+                    	// 失败是 OK的，因为允许tail不总是指向最后一个结点。
+                        casTail(t, newNode);
                     return true;
                 }
+                // 与其他线程竞争 CAS 失败，重新读取 next 属性。
                 // Lost CAS race to another thread; re-read next
+                
             }
             else if (p == q)
+            	// p == q 表示结点 p 已经从队列里移除。如果 tail 没有被修改，它也被从队列移除，
+            	// 在这种情况下，我们需要跳到 head；如果 tail 被修改，新的tail是个更好的赌注。
+            	// （tail不是实时更新，而是批量更新，此时 tail 落后于 head，还可能即使更新了也可能又落后了）
+            	
                 // We have fallen off list.  If tail is unchanged, it
                 // will also be off-list, in which case we need to
                 // jump to head, from which all live nodes are always
@@ -348,34 +390,42 @@ public class ConcurrentLinkedQueue<E> extends AbstractQueue<E>
                 p = (t != (t = tail)) ? t : head;
             else
                 // Check for tail updates after two hops.
+            	// 结点 p 仍然在队列上，且不是最后结点，p 向前移。
+            	// 在两跳之后检测 tail 的更新。
                 p = (p != t && t != (t = tail)) ? t : q;
         }
     }
 
-    public E poll() {
-        restartFromHead:
-        for (;;) {
-            for (Node<E> h = head, p = h, q;;) {
-                E item = p.item;
-
-                if (item != null && p.casItem(item, null)) {
-                    // Successful CAS is the linearization point
-                    // for item to be removed from this queue.
-                    if (p != h) // hop two nodes at a time
-                        updateHead(h, ((q = p.next) != null) ? q : p);
-                    return item;
-                }
-                else if ((q = p.next) == null) {
-                    updateHead(h, p);
-                    return null;
-                }
-                else if (p == q)
-                    continue restartFromHead;
-                else
-                    p = q;
-            }
-        }
-    }
+	public E poll() {
+	    restartFromHead:
+	    for (;;) {
+	        for (Node<E> h = head, p = h, q;;) {
+	            E item = p.item;
+	
+	            if (item != null && p.casItem(item, null)) {
+	                // Successful CAS is the linearization point
+	                // for item to be removed from this queue.
+	            	// 找到当前第一个存活结点，并从队列移除成功。
+	            	// 批量更新 head。
+	                if (p != h) // hop two nodes at a time
+	                    updateHead(h, ((q = p.next) != null) ? q : p); // 基于不变式：head != null
+	                return item;
+	            }
+	            else if ((q = p.next) == null) {
+	            	// p 是最后结点，且 p 的item已出队列，设置 p 为头结点。
+	            	// 空队列，返回null。
+	                updateHead(h, p);
+	                return null;
+	            }
+	            else if (p == q)
+	            	// p 已从队列移除，重新从 head 开始。
+	                continue restartFromHead;
+	            else
+	            	// 结点 p 还在队列，但 p.item 已出队，前移。
+	                p = q;
+	        }
+	    }
+	}
 
     public E peek() {
         restartFromHead:
@@ -387,8 +437,10 @@ public class ConcurrentLinkedQueue<E> extends AbstractQueue<E>
                     return item;
                 }
                 else if (p == q)
+                	// p 已从队列移除，重新从 head 开始。
                     continue restartFromHead;
                 else
+                	// 结点 p 还在队列，但 p.item 已出队，前移。
                     p = q;
             }
         }
@@ -412,8 +464,10 @@ public class ConcurrentLinkedQueue<E> extends AbstractQueue<E>
                     return hasItem ? p : null;
                 }
                 else if (p == q)
+                	// p 已从队列移除，重新从 head 开始。
                     continue restartFromHead;
                 else
+                	// 结点 p 还在队列，但 p.item 已出队，前移。
                     p = q;
             }
         }
