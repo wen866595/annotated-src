@@ -9,7 +9,10 @@
 
 
 *  [JUC ArrayBlockingQueue](http://coderbee.net/index.php/concurrent/20131225/682)
+*  [JUC LinkedBlockingQueue](http://coderbee.net/index.php/concurrent/20131226/685)
+*  [JUC ConcurrentLinkedQueue](http://coderbee.net/index.php/concurrent/20140108/701)
 
+*  [JUC 可重入 读写锁 ReentrantReadWriteLock](http://coderbee.net/index.php/concurrent/20140214/792)
 
 
 
